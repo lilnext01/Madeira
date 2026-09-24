@@ -1,0 +1,299 @@
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  LLVM_MINGW_VERSION: "20260922"
+  JOBS: "4"
+
+jobs:
+  build:
+    name: Build Madeira (unsigned IPA)
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Madeira + submodules
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install autoconf automake bison flex gettext libtool \
+            pkg-config ninja meson python llvm cmake
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM-MinGW
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/llvm-mingw"
+          cd "$RUNNER_TEMP/llvm-mingw"
+          curl -L --fail -o llvm-mingw.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-macos-universal.tar.xz"
+          tar -xf llvm-mingw.tar.xz --strip-components=1
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+          arm64ec-w64-mingw32-clang --version
+          aarch64-w64-mingw32-clang --version
+
+      - name: Prepare Wine
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init --recursive
+          mkdir -p wine/dlls/ntdll/unix
+
+          # Required by Wine's makedep before configure.
+          for h in ios_srv_stats.h ios_spin_hist.h ios_fastsync.h; do
+            if [ -f "build/ntdll-unix/shims/$h" ]; then
+              cp -f "build/ntdll-unix/shims/$h" "wine/dlls/ntdll/unix/$h"
+            fi
+          done
+
+          # arm64ec/aarch64 typelib alias used by widl.
+          for tlb in wine/dlls/*.tlb; do
+            if [ -d "$tlb/arm64ec-windows" ]; then
+              ln -sfn arm64ec-windows "$tlb/aarch64-windows"
+            fi
+          done
+
+      - name: Configure Wine macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd wine
+          mkdir -p build-macos
+          cd build-macos
+          ../../wine/configure \
+            --enable-archs=aarch64,arm64ec \
+            --disable-tests \
+            --without-x \
+            --without-wayland \
+            --without-alsa \
+            --without-pulse \
+            --without-gstreamer \
+            --without-cups \
+            --without-sane \
+            --without-v4l2
+
+      - name: Generate Wine macOS headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd wine/build-macos
+          make -j"$JOBS" include/config.h
+
+      - name: Configure Wine ARM64EC
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd wine
+          mkdir -p build-arm64ec
+          cd build-arm64ec
+          ../../wine/configure \
+            --enable-archs=arm64ec,aarch64 \
+            --disable-tests \
+            --without-x \
+            --without-wayland \
+            --without-alsa \
+            --without-pulse \
+            --without-gstreamer \
+            --without-cups \
+            --without-sane \
+            --without-v4l2 \
+            --with-mingw=clang
+
+      - name: Build Wine ARM64EC ntdll
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd wine/build-arm64ec
+          make -j"$JOBS" -C dlls/ntdll
+
+      - name: Build FEX for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf FEX/build-ios
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF
+          cmake --build FEX/build-ios --parallel "$JOBS"
+
+      - name: Build crypto/network support
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f build/crypto-unix/build.sh ]; then
+            chmod +x build/crypto-unix/build.sh
+            ./build/crypto-unix/build.sh
+          elif [ -f build/crypto-unix/gen_gnutls_symtab.sh ]; then
+            chmod +x build/crypto-unix/gen_gnutls_symtab.sh
+            ./build/crypto-unix/gen_gnutls_symtab.sh
+          fi
+
+      - name: Build ntdll Unix side
+        run: |
+          chmod +x build/ntdll-unix/build.sh
+          ./build/ntdll-unix/build.sh
+
+      - name: Build base wineserver archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f app/Madeira/libwineserver.a ]; then
+            cd wine/build-macos
+            make -j"$JOBS" server
+            find . -name 'libwineserver.a' -exec cp {} "$GITHUB_WORKSPACE/app/Madeira/libwineserver.a" \; -quit
+          fi
+          test -f "$GITHUB_WORKSPACE/app/Madeira/libwineserver.a"
+
+      - name: Build wineserver iOS side
+        run: |
+          chmod +x build/wineserver/build.sh
+          ./build/wineserver/build.sh
+
+      - name: Build FreeType iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f build/freetype-ios/build.sh ]; then
+            chmod +x build/freetype-ios/build.sh
+            ./build/freetype-ios/build.sh
+          elif [ -f build/freetype-ios/configure.sh ]; then
+            chmod +x build/freetype-ios/configure.sh
+            ./build/freetype-ios/configure.sh
+          fi
+
+      - name: Build win32u Unix side
+        run: |
+          chmod +x build/win32u-unix/build.sh
+          ./build/win32u-unix/build.sh
+
+      - name: Build LLVM 15 for DXMT
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d toolchains/llvm-project/llvm ]; then
+            mkdir -p toolchains
+            git clone --depth 1 --branch release/15.x \
+              https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          fi
+          rm -rf toolchains/llvm-ios-build
+          cmake -S toolchains/llvm-project/llvm \
+            -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF
+          cmake --build toolchains/llvm-ios-build --parallel "$JOBS" \
+            --target clang lld
+
+      - name: Build DXMT
+        run: |
+          chmod +x build/dxmt-ios/build.sh
+          ./build/dxmt-ios/build.sh
+
+      - name: Stage licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f build/stage-licenses.sh ]; then
+            chmod +x build/stage-licenses.sh
+            ./build/stage-licenses.sh
+          else
+            mkdir -p app/Madeira/licenses
+            cp COPYING app/Madeira/licenses/LICENSE-MADEIRA-GPL-3.0.txt
+            cp LICENSE-EXCEPTION.md app/Madeira/licenses/LICENSE-MADEIRA-EXCEPTION.txt
+          fi
+
+      - name: Verify native libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in \
+            app/Madeira/libntdll_unix.a \
+            app/Madeira/libwineserver.a \
+            app/Madeira/libwin32u_unix.a \
+            app/Madeira/libdxmt_combined.a
+          do
+            test -f "$f" || { echo "::error::Missing $f"; exit 1; }
+            ls -lh "$f"
+          done
+
+      - name: Build unsigned Madeira.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app/DerivedData
+
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -scheme Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath app/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find app/DerivedData/Build/Products/Release-iphoneos \
+            -maxdepth 1 -name Madeira.app -print -quit)
+          test -n "$APP"
+
+          rm -rf ipa
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/Madeira.app
+
+          cd ipa
+          zip -qry ../Madeira-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-IPA
+          path: Madeira-unsigned.ipa
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-build-diagnostics
+          path: |
+            app/DerivedData/**/*.log
+            build/**/*.err
+            build/**/*.txt
+            wine/build-*/config.log
+          if-no-files-found: ignore
+          retention-days: 7
