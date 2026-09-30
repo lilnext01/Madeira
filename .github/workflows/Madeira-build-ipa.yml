@@ -6,365 +6,218 @@ on:
 permissions:
   contents: read
 
-env:
-  DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
-  JOBS: "4"
-
 jobs:
   build:
-    name: Build Madeira IPA
+    name: Build Madeira
     runs-on: macos-15
-    timeout-minutes: 360
 
     steps:
-      - name: Checkout Madeira
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
           submodules: recursive
+          fetch-depth: 0
 
-      - name: Show toolchain
+      - name: Show environment
         run: |
-          set -euxo pipefail
+          echo "=== macOS ==="
+          sw_vers
+
+          echo "=== Xcode ==="
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          clang --version
-          cmake --version
-          ninja --version
+
+          echo "=== Swift ==="
+          swift --version
+
+          echo "=== Repository ==="
+          git status
+          git submodule status
 
       - name: Install build dependencies
         run: |
-          set -euo pipefail
-          brew install autoconf automake bison flex gettext libtool \
-            pkg-config cmake ninja meson python llvm@15
+          brew update
 
-          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
-          echo "$(brew --prefix llvm@15)/bin" >> "$GITHUB_PATH"
+          brew install \
+            cmake \
+            ninja \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            gettext \
+            bison \
+            flex \
+            meson \
+            nasm
 
-      # The current Madeira repository already ships the ARM64EC/AArch64
-      # Wine runtime resources. We do NOT rebuild Wine's PE side here.
-      # This deliberately avoids the separate LLVM-MinGW installation that
-      # previously failed with "arm64ec-w64-mingw32-clang: command not found".
-      - name: Verify bundled Wine PE resources
+      - name: Make build scripts executable
+        run: |
+          find build -type f -name "build.sh" -exec chmod +x {} \;
+          find scripts -type f -name "*.sh" -exec chmod +x {} \; || true
+
+      - name: Show build scripts
+        run: |
+          echo "=== build scripts ==="
+          find build -type f -name "build.sh" -print | sort
+
+      - name: Build native components
         shell: bash
         run: |
           set -euo pipefail
 
-          test -d app/Madeira/aarch64-windows
-          test -d app/Madeira/arm64ec-windows
+          for script in $(find build -type f -name "build.sh" | sort); do
+            echo ""
+            echo "=============================================="
+            echo "BUILDING: $script"
+            echo "=============================================="
 
-          echo "AArch64 Wine resources:"
-          find app/Madeira/aarch64-windows -maxdepth 2 -type f | head -40 || true
-
-          echo "ARM64EC Wine resources:"
-          find app/Madeira/arm64ec-windows -maxdepth 2 -type f | head -40 || true
-
-      - name: Configure Wine native build
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x wine/configure
-
-          rm -rf wine/build-macos
-
-          mkdir -p wine/build-macos
-          cd wine/build-macos
-
-          ../../wine/configure \
-            --enable-archs=aarch64 \
-            --disable-tests \
-            --without-x \
-            --without-wayland \
-            --without-alsa \
-            --without-pulse \
-            --without-gstreamer \
-            --without-cups \
-            --without-sane \
-            --without-v4l2
-
-          make -j"$JOBS" include/config.h
-
-      # The ntdll iOS build only needs the generated Wine headers.
-      # The PE resources themselves are already present in the repository.
-      - name: Prepare Wine generated headers
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p wine/build-arm64ec
-
-          if [ -d wine/build-macos/include ]; then
-            ln -sfn ../build-macos/include wine/build-arm64ec/include
-          fi
-
-          # The current iOS ntdll source includes these shim headers directly.
-          # They are supplied by Madeira and do not require an ARM64EC compiler.
-          mkdir -p wine/dlls/ntdll/unix
-
-          for h in ios_srv_stats.h ios_spin_hist.h ios_fastsync.h; do
-            if [ -f "build/ntdll-unix/shims/$h" ]; then
-              cp -f "build/ntdll-unix/shims/$h" \
-                "wine/dlls/ntdll/unix/$h"
-            fi
+            (
+              cd "$(dirname "$script")"
+              ./build.sh
+            )
           done
 
-      - name: Fetch FreeType source
+      - name: Locate Xcode project
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -d research/freetype ]; then
-            git clone --depth 1 \
-              --branch VER-2-13-3 \
-              https://github.com/freetype/freetype.git \
-              research/freetype
-          fi
+          echo "=== Xcode projects ==="
 
-      - name: Build FreeType for iOS
+          find app \
+            \( -name "*.xcodeproj" -o -name "*.xcworkspace" \) \
+            -print
+
+      - name: Detect Xcode project and scheme
+        id: xcode
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod +x build/freetype-ios/build.sh
-          ./build/freetype-ios/build.sh
+          PROJECT=$(find app -maxdepth 4 -name "*.xcodeproj" -print -quit)
+          WORKSPACE=$(find app -maxdepth 4 -name "*.xcworkspace" -print -quit)
 
-      - name: Fetch GnuTLS sources
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p build/gnutls-ios/src
-
-          cd build/gnutls-ios/src
-
-          curl -L --fail -o gmp-6.3.0.tar.xz \
-            https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
-
-          curl -L --fail -o nettle-3.10.1.tar.gz \
-            https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz
-
-          curl -L --fail -o gnutls-3.8.9.tar.xz \
-            https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-3.8.9.tar.xz
-
-      - name: Build GnuTLS for iOS
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x build/gnutls-ios/build.sh
-          ./build/gnutls-ios/build.sh
-
-      - name: Build ntdll Unix side
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x build/ntdll-unix/build.sh
-          ./build/ntdll-unix/build.sh
-
-      - name: Build base wineserver archive
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          cd wine/build-macos
-
-          make -j"$JOBS" server
-
-          BASE=$(find . -name libwineserver.a -type f -print -quit)
-
-          if [ -z "$BASE" ]; then
-            echo "::error::libwineserver.a was not generated"
+          if [ -n "$WORKSPACE" ]; then
+            echo "workspace=$WORKSPACE" >> "$GITHUB_OUTPUT"
+            echo "Using workspace: $WORKSPACE"
+          elif [ -n "$PROJECT" ]; then
+            echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+            echo "Using project: $PROJECT"
+          else
+            echo "ERROR: No Xcode project/workspace found."
             exit 1
           fi
 
-          cp "$BASE" "$GITHUB_WORKSPACE/app/Madeira/libwineserver.a"
-
-          ls -lh "$GITHUB_WORKSPACE/app/Madeira/libwineserver.a"
-
-      - name: Build wineserver iOS side
+      - name: List Xcode schemes
         shell: bash
         run: |
           set -euo pipefail
 
-          chmod +x build/wineserver/build.sh
-          ./build/wineserver/build.sh
-
-      - name: Build win32u Unix side
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          chmod +x build/win32u-unix/build.sh
-          ./build/win32u-unix/build.sh
-
-      - name: Build FEX for iOS
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          rm -rf FEX/build-ios
-
-          cmake \
-            -S FEX \
-            -B FEX/build-ios \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
-            -DBUILD_FEX_LINUX_TESTS=OFF \
-            -DBUILD_THUNKS=OFF \
-            -DBUILD_FEXCONFIG=OFF
-
-          cmake --build FEX/build-ios --parallel "$JOBS"
-
-      - name: Fetch LLVM 15 source for DXMT
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p toolchains
-
-          if [ ! -d toolchains/llvm-project/llvm ]; then
-            git clone --depth 1 \
-              --branch llvmorg-15.0.7 \
-              https://github.com/llvm/llvm-project.git \
-              toolchains/llvm-project
+          if [ -n "${{ steps.xcode.outputs.workspace }}" ]; then
+            xcodebuild \
+              -workspace "${{ steps.xcode.outputs.workspace }}" \
+              -list
+          else
+            xcodebuild \
+              -project "${{ steps.xcode.outputs.project }}" \
+              -list
           fi
 
-      - name: Build LLVM 15 for DXMT
+      - name: Build iOS application
         shell: bash
         run: |
           set -euo pipefail
 
-          rm -rf toolchains/llvm-ios-build
+          mkdir -p build/DerivedData
 
-          cmake \
-            -S toolchains/llvm-project/llvm \
-            -B toolchains/llvm-ios-build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
-            -DLLVM_TARGETS_TO_BUILD=AArch64 \
-            -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_ENABLE_TERMINFO=OFF \
-            -DLLVM_ENABLE_ZLIB=OFF \
-            -DLLVM_ENABLE_ZSTD=OFF \
-            -DLLVM_ENABLE_LIBXML2=OFF
+          if [ -n "${{ steps.xcode.outputs.workspace }}" ]; then
 
-          cmake --build toolchains/llvm-ios-build \
-            --parallel "$JOBS" \
-            --target clang lld
+            xcodebuild \
+              -workspace "${{ steps.xcode.outputs.workspace }}" \
+              -scheme Madeira \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              build
 
-      - name: Build DXMT iOS library
-        shell: bash
-        run: |
-          set -euo pipefail
+          else
 
-          chmod +x build/dxmt-ios/build.sh
-          ./build/dxmt-ios/build.sh
+            xcodebuild \
+              -project "${{ steps.xcode.outputs.project }}" \
+              -scheme Madeira \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination "generic/platform=iOS" \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              build
 
-      - name: Verify required static libraries
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          required=(
-            app/Madeira/libntdll_unix.a
-            app/Madeira/libwineserver.a
-            app/Madeira/libwin32u_unix.a
-          )
-
-          for f in "${required[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "::error::Missing $f"
-              exit 1
-            fi
-            ls -lh "$f"
-          done
-
-          # DXMT's current script refreshes libdxmt_combined.a only when a
-          # combined archive already exists. Fail clearly if it was not
-          # produced by the current DXMT build chain.
-          if [ ! -f app/Madeira/libdxmt_combined.a ]; then
-            echo "::error::libdxmt_combined.a was not produced."
-            echo "DXMT output:"
-            find build/dxmt-ios -maxdepth 2 -name '*.a' -print || true
-            exit 1
           fi
 
-      - name: Build unsigned Madeira.app
+      - name: Find application
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
 
-          rm -rf app/DerivedData
+          echo "=== Applications ==="
 
-          xcodebuild \
-            -project app/Madeira.xcodeproj \
-            -scheme Madeira \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath app/DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            build
+          find build/DerivedData \
+            -type d \
+            -name "*.app" \
+            -print
 
       - name: Package IPA
         shell: bash
         run: |
           set -euo pipefail
 
-          APP=$(find app/DerivedData/Build/Products/Release-iphoneos \
-            -maxdepth 1 \
+          APP=$(find build/DerivedData \
             -type d \
-            -name 'Madeira.app' \
+            -name "Madeira.app" \
             -print -quit)
 
           if [ -z "$APP" ]; then
-            echo "::error::Madeira.app was not generated"
-            find app/DerivedData/Build/Products -maxdepth 3 -type d -name '*.app' -print || true
+            echo "ERROR: Madeira.app not found."
+
+            echo ""
+            echo "Available applications:"
+            find build/DerivedData \
+              -type d \
+              -name "*.app" \
+              -print
+
             exit 1
           fi
 
-          rm -rf ipa
-          mkdir -p ipa/Payload
-          cp -R "$APP" ipa/Payload/Madeira.app
+          echo "Application:"
+          echo "$APP"
 
-          cd ipa
-          /usr/bin/zip -qry ../Madeira-unsigned.ipa Payload
+          rm -rf Payload
+          mkdir -p Payload
 
-          cd ..
-          ls -lh Madeira-unsigned.ipa
+          cp -R "$APP" Payload/Madeira.app
 
-      - name: Upload IPA
+          rm -f Madeira.ipa
+
+          zip -r Madeira.ipa Payload
+
+      - name: Verify IPA
+        run: |
+          echo "=== IPA ==="
+          ls -lh Madeira.ipa
+
+          echo ""
+          echo "=== IPA contents ==="
+          unzip -l Madeira.ipa | head -100
+
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Madeira-unsigned-IPA
-          path: Madeira-unsigned.ipa
+          name: Madeira-IPA
+          path: Madeira.ipa
+          if-no-files-found: error
           retention-days: 30
-
-      - name: Upload build diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Madeira-build-diagnostics
-          path: |
-            app/DerivedData/**/*.log
-            build/**/*.err
-            build/**/*.txt
-            build/gnutls-ios/obj/*.log
-            wine/build-macos/config.log
-          if-no-files-found: ignore
-          retention-days: 7
